@@ -1,0 +1,144 @@
+name: Clawd Recruiter
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # every 5 minutes
+  workflow_dispatch:        # manual trigger from GitHub UI
+
+jobs:
+  recruit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+
+    steps:
+      - name: Run Clawd
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ATP_REGISTRY: https://atp-registry.rablair4.workers.dev
+        run: |
+          pip install anthropic -q
+          python3 << 'PYEOF'
+          import os, re, json, time, hashlib, uuid, urllib.request, urllib.error
+          from datetime import datetime, timezone
+
+          REGISTRY      = os.environ["ATP_REGISTRY"]
+          ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
+          CLAUDE_MODEL  = "claude-sonnet-4-20250514"
+          MAX_AGENTS    = 5
+
+          def post(path, data, agent_id=""):
+              url  = f"{REGISTRY}{path}"
+              body = json.dumps(data).encode()
+              req  = urllib.request.Request(url, data=body,
+                  headers={"Content-Type":"application/json",
+                           "User-Agent":"clawd-github/1.0",
+                           "X-ATP-Agent-ID": agent_id},
+                  method="POST")
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      return json.loads(r.read())
+              except urllib.error.HTTPError as e:
+                  txt = e.read().decode()
+                  print(f"  POST {path} → {e.code}: {txt[:100]}")
+                  try: return json.loads(txt)
+                  except: return {"error": txt}
+              except Exception as e:
+                  print(f"  POST {path} error: {e}")
+                  return {"error": str(e)}
+
+          def get(path):
+              req = urllib.request.Request(f"{REGISTRY}{path}",
+                  headers={"User-Agent":"clawd-github/1.0"})
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      return json.loads(r.read())
+              except Exception as e:
+                  print(f"  GET {path} error: {e}")
+                  return {}
+
+          def claude(prompt):
+              body = {
+                  "model": CLAUDE_MODEL, "max_tokens": 2048,
+                  "system": "You are CLAWD, the ATP World Recruiter. Return ONLY a valid JSON array. No markdown. No backticks. Start with [ end with ].",
+                  "messages": [{"role": "user", "content": prompt}]
+              }
+              req = urllib.request.Request("https://api.anthropic.com/v1/messages",
+                  data=json.dumps(body).encode(),
+                  headers={"Content-Type":"application/json",
+                           "x-api-key": ANTHROPIC_KEY,
+                           "anthropic-version":"2023-06-01"},
+                  method="POST")
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      data = json.loads(r.read())
+                      return data["content"][0]["text"]
+              except urllib.error.HTTPError as e:
+                  err = e.read().decode()
+                  if "credit" in err.lower(): print("⚠ Add credits: console.anthropic.com")
+                  else: print(f"Claude error: {err[:150]}")
+                  return ""
+              except Exception as e:
+                  print(f"Claude error: {e}")
+                  return ""
+
+          def sha256(s):
+              return hashlib.sha256(s.encode()).hexdigest()
+
+          def register(name, endpoint, capabilities, domains, description):
+              agent_id = sha256(endpoint)
+              result = post("/agents", {
+                  "agent_id": agent_id, "name": name, "endpoint": endpoint,
+                  "description": description, "capabilities": capabilities, "domains": domains,
+                  "public_key": sha256(f"pk:{endpoint}:{agent_id}"),
+                  "manifest_signature": sha256(f"{agent_id}:{endpoint}"),
+                  "version": "2.0.0"
+              }, agent_id)
+              return result.get("success"), agent_id
+
+          # Get world state
+          world = get("/agents?limit=100")
+          agents = world.get("agents", [])
+          count = world.get("count", len(agents))
+          existing = {a["name"] for a in agents}
+          print(f"World: {count} agents")
+
+          # Generate candidates
+          prompt = f"""Generate {MAX_AGENTS} diverse AI agent candidates for the ATP world ({count} agents registered).
+          Avoid these names: {list(existing)[:20]}
+          Each needs: name, endpoint (https://slug.atp.network), description, capabilities (list), domains (list).
+          Domains: security, legal, finance, medical, code, research, translation, data, marketing, hr
+          Return ONLY a JSON array."""
+
+          response = claude(prompt)
+          if not response:
+              print("Claude returned empty")
+              exit(0)
+
+          try:
+              clean = response.replace("```json","").replace("```","").strip()
+              start, end = clean.index("["), clean.rindex("]")
+              candidates = json.loads(clean[start:end+1])
+          except Exception as e:
+              print(f"Parse error: {e}\nRaw: {response[:300]}")
+              exit(0)
+
+          print(f"{len(candidates)} candidates")
+          recruited = 0
+
+          for c in candidates:
+              name     = c.get("name","")
+              endpoint = c.get("endpoint","")
+              if not name or not endpoint or name in existing:
+                  continue
+              ok, agent_id = register(name, endpoint,
+                  c.get("capabilities",[]), c.get("domains",["general"]), c.get("description",""))
+              if ok:
+                  existing.add(name)
+                  recruited += 1
+                  print(f"  ✓ {name}")
+              else:
+                  print(f"  · {name} (already registered or failed)")
+              time.sleep(0.3)
+
+          print(f"\nDone — recruited {recruited}. World now: {count + recruited}")
+          PYEOF
